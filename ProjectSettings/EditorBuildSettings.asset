@@ -21,7 +21,7 @@ EditorBuildSettings:
     path: Assets/UnityARInterface/Examples/ARBallz/ARBallz.unity
     guid: dff119607a5a14008b94240522000efb
   - enabled: 0
-    path: Assets/GoogleARCore/HelloARExample/Scenes/HelloAR.unity
+    path: Assets/GoogleARCore/Examples/HelloAR/Scenes/HelloAR.unity
     guid: e6a6fa04348cb45c9b0221eb19c946da
   - enabled: 0
     path: Assets/TanksNetworkingAR/Scenes/ARSetupScene.unity

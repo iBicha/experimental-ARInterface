@@ -9,43 +9,10 @@ using UnityEngine.XR;
 namespace UnityARInterface
 {
     public class ARCoreInterface : ARInterface
-    {
-       
-#region ARCoreCameraAPI
-        public const string ARCoreCameraUtilityAPI = "arcore_camera_utility";
-
-        //Texture size. Larger values are slower.
-        private const int k_ARCoreTextureWidth = 640;
-        private const int k_ARCoreTextureHeight = 480;
-
-        //If imageFormatType is set to ImageFormatColor, the buffer is converted to YUV2.
-        //If imageFormatType is set to ImageFormatGrayscale, the buffer is set to Y as is, 
-        //while the UV components remain null. Will appear pink using the remote
-        private const ImageFormatType k_ImageFormatType = ImageFormatType.ImageFormatColor;
-
-        [DllImport(ARCoreCameraUtilityAPI)]
-        public static extern void TextureReader_create(int format, int width, int height, bool keepAspectRatio);
-
-        [DllImport(ARCoreCameraUtilityAPI)]
-        public static extern void TextureReader_destroy();
-
-        [DllImport(ARCoreCameraUtilityAPI)]
-        public static extern IntPtr TextureReader_submitAndAcquire(
-            int textureId, int textureWidth, int textureHeight, ref int bufferSize);
-
-        private enum ImageFormatType
-        {
-            ImageFormatColor = 0,
-            ImageFormatGrayscale = 1
-        }
-
-        private byte[] pixelBuffer;
-
-#endregion
-
-        private List<TrackedPlane> m_TrackedPlaneBuffer = new List<TrackedPlane>();
+    {       
+        private List<DetectedPlane> m_DetectedPlaneBuffer = new List<DetectedPlane>();
         private ScreenOrientation m_CachedScreenOrientation;
-        private Dictionary<TrackedPlane, BoundedPlane> m_TrackedPlanes = new Dictionary<TrackedPlane, BoundedPlane>();
+        private Dictionary<DetectedPlane, BoundedPlane> m_DetectedPlanes = new Dictionary<DetectedPlane, BoundedPlane>();
         private ARCoreSession m_ARCoreSession;
         private ARCoreSessionConfig m_ARCoreSessionConfig;
         private ARBackgroundRenderer m_BackgroundRenderer;
@@ -87,7 +54,7 @@ namespace UnityARInterface
                 m_ARCoreSessionConfig = ScriptableObject.CreateInstance<ARCoreSessionConfig>();
 
             m_ARCoreSessionConfig.EnableLightEstimation = settings.enableLightEstimation;
-            m_ARCoreSessionConfig.EnablePlaneFinding = settings.enablePlaneDetection;
+            m_ARCoreSessionConfig.PlaneFindingMode = settings.enablePlaneDetection ? DetectedPlaneFindingMode.HorizontalAndVertical : DetectedPlaneFindingMode.Disabled;
             //Do we want to match framerate to the camera?
             m_ARCoreSessionConfig.MatchCameraFramerate = true;
 
@@ -147,9 +114,6 @@ namespace UnityARInterface
             // If we make it out of the while loop, then the session is initialized and valid
             IsRunning = true;
 
-            if (IsRunning)
-                TextureReader_create((int)k_ImageFormatType, k_ARCoreTextureWidth, k_ARCoreTextureHeight, true);
-
         }
 
         public override void StopService()
@@ -161,7 +125,6 @@ namespace UnityARInterface
             }
 
             m_ARCoreSession.enabled = false;
-            TextureReader_destroy();
             BackgroundRendering = false;
             m_BackgroundRenderer.backgroundMaterial = null;
             m_BackgroundRenderer.camera = null;
@@ -181,84 +144,68 @@ namespace UnityARInterface
 
         public override bool TryGetCameraImage(ref CameraImage cameraImage)
         {
-            if (Session.Status != SessionStatus.Tracking)
-                return false;
-
-            if (Frame.CameraImage.Texture == null || Frame.CameraImage.Texture.GetNativeTexturePtr() == IntPtr.Zero)
-                return false;
-
-            //This is a GL texture ID
-            int textureId = Frame.CameraImage.Texture.GetNativeTexturePtr().ToInt32();
-            int bufferSize = 0;
-            //Ask the native plugin to start reading the image of the current frame, 
-            //and return the image read from the privous frame
-            IntPtr bufferPtr = TextureReader_submitAndAcquire(textureId, k_ARCoreTextureWidth, k_ARCoreTextureHeight, ref bufferSize);
-
-            //I think this is needed because of this bug
-            //https://github.com/google-ar/arcore-unity-sdk/issues/66
-            GL.InvalidateState();
-
-            if (bufferPtr == IntPtr.Zero || bufferSize == 0)
-                return false;
-
-            if (pixelBuffer == null || pixelBuffer.Length != bufferSize)
-                pixelBuffer = new byte[bufferSize];
-
-            //Copy buffer
-            Marshal.Copy(bufferPtr, pixelBuffer, 0, bufferSize);
-
-            //Convert to YUV data
-            PixelBuffertoYUV2(pixelBuffer ,k_ARCoreTextureWidth, k_ARCoreTextureHeight, 
-                              k_ImageFormatType, ref cameraImage.y, ref cameraImage.uv);
-
-            cameraImage.width = k_ARCoreTextureWidth;
-            cameraImage.height = k_ARCoreTextureHeight;
-
-            return true;
-        }
-
-
-        private void PixelBuffertoYUV2(byte[] rgba, int width, int height,ImageFormatType imageFormatType ,ref byte[] y, ref byte[] uv)
-        {
-            //in grayscale, it's a byte per pixel, which we can just assign to Y, and leave uv null
-            //Probably not the most accurate conversion, would save some performance
-            if (imageFormatType == ImageFormatType.ImageFormatGrayscale)
+            const bool LuminanceOnly = false;
+            
+            using (var imageBytes = Frame.CameraImage.AcquireCameraImageBytes())
             {
-                y = rgba;
-                uv = null;
-                return;
-            }
+                if (!imageBytes.IsAvailable)
+                    return false;
 
-            int pixelCount = width * height;
-
-            if (y == null || y.Length != pixelCount)
-                y = new byte[pixelCount];
-
-            if (uv == null || uv.Length != pixelCount / 2)
-                uv = new byte[pixelCount / 2];
-
-            int iY = 0;
-            int iUV = 0;
-            int iRGBA = 0;
-
-            for (int row = 0; row < height; row++)
-            {
-                for (int column = 0; column < width; column++)
+                cameraImage.width = imageBytes.Width;
+                cameraImage.height = imageBytes.Height;
+                
+                if (imageBytes.YRowStride != imageBytes.Width)
                 {
-                    //Random magic starts here!
-                    //Convert every pixel to 1 byte Y
-                    y[iY++] = (byte)(((66 * rgba[iRGBA] + 129 * rgba[iRGBA + 1] + 25 * rgba[iRGBA + 2] + 128) >> 8) + 16);
-                    //Convert every pixel to 2 bytes UV at quarter resolution
-                    if (row % 2 == 0 && column % 2 == 0)
-                    {
-                        uv[iUV++] = (byte)(((-38 * rgba[iRGBA] - 74 * rgba[iRGBA + 1] + 112 * rgba[iRGBA + 2] + 128) >> 8) + 128);
-                        uv[iUV++] = (byte)(((112 * rgba[iRGBA] - 94 * rgba[iRGBA + 1] - 18 * rgba[iRGBA + 2] + 128) >> 8) + 128);
-                    }
-                    //To next pixel
-                    iRGBA += 4;
+                    //Y shoud be 1 byte per pixel. Not doing anything otherwise.
+                    return false;
                 }
+
+                //We expect 1 byte per pixel for Y
+                int bufferSize = imageBytes.Width * imageBytes.Height;
+                if(cameraImage.y == null || cameraImage.y.Length != bufferSize)
+                    cameraImage.y = new byte[bufferSize];
+
+                //Y plane is copied as is.
+                Marshal.Copy(imageBytes.Y, cameraImage.y, 0, bufferSize);
+
+                if (LuminanceOnly || imageBytes.UVRowStride != imageBytes.Width || imageBytes.UVPixelStride != 2)
+                {
+                    //Not doing any weird values. Y is probably enough.
+                    cameraImage.uv = null;
+                    return true;
+                }
+                
+                //We expect 2 bytes per pixel, interleaved U/V, with 2x2 subsampling
+                bufferSize = imageBytes.Width * imageBytes.Height / 2;
+                if(cameraImage.uv == null || cameraImage.uv.Length != bufferSize)
+                    cameraImage.uv = new byte[bufferSize];
+
+                //Because U and V planes are returned seperately, while remote expects interleaved U/V
+                //same as ARKit, we copy buffers ourselves
+                unsafe
+                {
+                    fixed (byte* uvPtr = cameraImage.uv)
+                    {
+                        byte* UV = uvPtr;
+                        
+                        byte* U = (byte*) imageBytes.U.ToPointer();
+                        byte* V = (byte*) imageBytes.V.ToPointer();
+
+                        for (int i = 0; i < bufferSize; i+= 2)
+                        {
+                            *UV++ = *U;
+                            *UV++ = *V;
+
+                            U += imageBytes.UVPixelStride;
+                            V += imageBytes.UVPixelStride;
+                        }
+                    }
+                }
+                
+                return true;
             }
         }
+
 
         public override bool TryGetPointCloud(ref PointCloud pointCloud)
         {
@@ -371,12 +318,12 @@ namespace UnityARInterface
 
         }
 
-        private bool PlaneUpdated(TrackedPlane tp, BoundedPlane bp)
+        private bool PlaneUpdated(DetectedPlane detectedPlanep, BoundedPlane bp)
         {
-            var tpExtents = new Vector2(tp.ExtentX, tp.ExtentZ);
+            var tpExtents = new Vector2(detectedPlanep.ExtentX, detectedPlanep.ExtentZ);
             var extents = Vector2.Distance(tpExtents, bp.extents) > 0.005f;
-            var rotation = tp.CenterPose.rotation != bp.rotation;
-            var position = Vector2.Distance(tp.CenterPose.position, bp.center) > 0.005f;
+            var rotation = detectedPlanep.CenterPose.rotation != bp.rotation;
+            var position = Vector2.Distance(detectedPlanep.CenterPose.position, bp.center) > 0.005f;
             return (extents || rotation || position);
         }
 
@@ -390,28 +337,28 @@ namespace UnityARInterface
             if (Session.Status != SessionStatus.Tracking)
                 return;
 
-            if(m_ARCoreSessionConfig.EnablePlaneFinding)
+            if(m_ARCoreSessionConfig.PlaneFindingMode != DetectedPlaneFindingMode.Disabled)
             {
-                Session.GetTrackables<TrackedPlane>(m_TrackedPlaneBuffer, TrackableQueryFilter.All);
-                foreach (var trackedPlane in m_TrackedPlaneBuffer)
+                Session.GetTrackables<DetectedPlane>(m_DetectedPlaneBuffer, TrackableQueryFilter.All);
+                foreach (var detectedPlane in m_DetectedPlaneBuffer)
                 {
                     BoundedPlane boundedPlane;
-                    if (m_TrackedPlanes.TryGetValue(trackedPlane, out boundedPlane))
+                    if (m_DetectedPlanes.TryGetValue(detectedPlane, out boundedPlane))
                     {
                         // remove any subsumed planes
-                        if (trackedPlane.SubsumedBy != null)
+                        if (detectedPlane.SubsumedBy != null)
                         {
                             OnPlaneRemoved(boundedPlane);
-                            m_TrackedPlanes.Remove(trackedPlane);
+                            m_DetectedPlanes.Remove(detectedPlane);
                         }
                         // update any planes with changed extents
-                        else if (PlaneUpdated(trackedPlane, boundedPlane))
+                        else if (PlaneUpdated(detectedPlane, boundedPlane))
                         {
-                            boundedPlane.center = trackedPlane.CenterPose.position;
-                            boundedPlane.rotation = trackedPlane.CenterPose.rotation;
-                            boundedPlane.extents.x = trackedPlane.ExtentX;
-                            boundedPlane.extents.y = trackedPlane.ExtentZ;
-                            m_TrackedPlanes[trackedPlane] = boundedPlane;
+                            boundedPlane.center = detectedPlane.CenterPose.position;
+                            boundedPlane.rotation = detectedPlane.CenterPose.rotation;
+                            boundedPlane.extents.x = detectedPlane.ExtentX;
+                            boundedPlane.extents.y = detectedPlane.ExtentZ;
+                            m_DetectedPlanes[detectedPlane] = boundedPlane;
                             OnPlaneUpdated(boundedPlane);
                         }
                     }
@@ -421,30 +368,30 @@ namespace UnityARInterface
                         boundedPlane = new BoundedPlane()
                         {
                             id = Guid.NewGuid().ToString(),
-                            center = trackedPlane.CenterPose.position,
-                            rotation = trackedPlane.CenterPose.rotation,
-                            extents = new Vector2(trackedPlane.ExtentX, trackedPlane.ExtentZ)
+                            center = detectedPlane.CenterPose.position,
+                            rotation = detectedPlane.CenterPose.rotation,
+                            extents = new Vector2(detectedPlane.ExtentX, detectedPlane.ExtentZ)
                         };
 
-                        m_TrackedPlanes.Add(trackedPlane, boundedPlane);
+                        m_DetectedPlanes.Add(detectedPlane, boundedPlane);
                         OnPlaneAdded(boundedPlane);
                     }
                 }
 
                 // Check for planes that were removed from the tracked plane list
-                List<TrackedPlane> planesToRemove = new List<TrackedPlane>();
-                foreach (var kvp in m_TrackedPlanes)
+                List<DetectedPlane> planesToRemove = new List<DetectedPlane>();
+                foreach (var kvp in m_DetectedPlanes)
                 {
-                    var trackedPlane = kvp.Key;
-                    if (!m_TrackedPlaneBuffer.Exists(x => x == trackedPlane))
+                    var detectedPlane = kvp.Key;
+                    if (!m_DetectedPlaneBuffer.Exists(x => x == detectedPlane))
                     {
                         OnPlaneRemoved(kvp.Value);
-                        planesToRemove.Add(trackedPlane);
+                        planesToRemove.Add(detectedPlane);
                     }
                 }
 
                 foreach (var plane in planesToRemove)
-                    m_TrackedPlanes.Remove(plane);
+                    m_DetectedPlanes.Remove(plane);
 
             }
 
